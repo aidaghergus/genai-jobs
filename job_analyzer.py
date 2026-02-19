@@ -48,10 +48,20 @@ with st.sidebar:
 # ==============================================================================
 # 2. DATA MODELS (PYDANTIC SCHEMAS)
 # ==============================================================================
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field, model_validator
+
+
 class SalaryRange(BaseModel):
     min: int = Field(..., ge=0, description="Salariul minim")
     max: int = Field(..., ge=0, description="Salariul maxim")
-    currency: str = Field(..., description="Moneda (ex: EUR, USD, RON)")
+    currency: str = Field(..., description="Moneda (EUR, USD, RON etc.)")
+
+    @model_validator(mode="after")
+    def check_range(self):
+        if self.max < self.min:
+            raise ValueError("Salary max nu poate fi mai mic decât min.")
+        return self
 
 
 class Location(BaseModel):
@@ -62,47 +72,53 @@ class Location(BaseModel):
 
 class RedFlag(BaseModel):
     severity: Literal["low", "medium", "high"] = Field(
-        ..., description="Nivelul de gravitate al red flag-ului"
+        ..., description="Nivel gravitate"
     )
     category: Literal["toxicity", "vague", "unrealistic"] = Field(
-        ..., description="Categoria problemei identificate"
+        ..., description="Categoria problemei"
     )
-    description: str = Field(..., description="Descriere scurtă a red flag-ului")
+    description: str = Field(..., description="Descriere scurtă")
 
 
 class JobAnalysis(BaseModel):
-    role_title: str = Field(..., description="Titlul jobului standardizat")
-    company_name: str = Field(..., description="Numele companiei")
-    
-    seniority: Literal["Intern", "Junior", "Mid", "Senior", "Lead", "Architect"] = Field(
-        ..., description="Nivelul de experiență dedus"
-    )
+    role_title: str
+    company_name: str
 
-    match_score: int = Field(
-        ..., ge=0, le=100,
-        description="Scor 0-100: Calitatea descrierii jobului"
-    )
+    seniority: Literal["Intern", "Junior", "Mid", "Senior", "Lead", "Architect"]
 
-    tech_stack: List[str] = Field(
-        ..., description="Listă cu tehnologii specifice (ex: Python, AWS, React)"
-    )
+    match_score: int = Field(..., ge=0, le=100)
 
-    salary_range: Optional[SalaryRange] = Field(
-        None, description="Interval salarial dacă este menționat"
-    )
+    tech_stack: List[str]
 
-    location: Optional[Location] = Field(
-        None, description="Informații despre locația jobului"
-    )
+    salary_range: Optional[SalaryRange] = None
+    location: Optional[Location] = None
 
-    red_flags: List[RedFlag] = Field(
-        default_factory=list,
-        description="Lista de semnale de alarmă detectate"
-    )
+    red_flags: List[RedFlag] = Field(default_factory=list)
 
-    summary: str = Field(
-        ..., description="Un rezumat scurt al rolului (max 2 fraze) în limba română"
-    )
+    summary: str
+
+    @model_validator(mode="after")
+    def validate_remote_consistency(self):
+        """
+        Dacă jobul e remote, dar apar indicii că e necesară prezența fizică,
+        adăugăm automat un red flag.
+        """
+
+        if self.location and self.location.is_remote:
+            office_keywords = ["on-site", "office presence", "la birou", "prezență fizică"]
+
+            for flag in self.red_flags:
+                if any(keyword in flag.description.lower() for keyword in office_keywords):
+                    self.red_flags.append(
+                        RedFlag(
+                            severity="medium",
+                            category="unrealistic",
+                            description="Job marcat remote, dar descrierea sugerează prezență fizică."
+                        )
+                    )
+                    break
+
+        return self
 
 # ==============================================================================
 # 3. UTILS - SCRAPER (Colectare Date)
@@ -193,29 +209,81 @@ with tab1:
                     
                     # -- DISPLAY --
                     st.divider()
+
+                    # ===============================
+                    # HEADER SECTION
+                    # ===============================
                     col_h1, col_h2 = st.columns([3, 1])
+
                     with col_h1:
-                        st.markdown(f"### {data.role_title}")
-                        st.caption(f"Companie: **{data.company_name}** | Nivel: **{data.seniority}**")
+                        st.markdown(f"## {data.role_title}")
+                        st.caption(f"🏢 {data.company_name} • 🎯 {data.seniority}")
+
                     with col_h2:
-                        color = "normal" if data.match_score > 70 else "inverse"
-                        st.metric("Quality Score", f"{data.match_score}/100", delta_color=color)
+                        score_color = "normal" if data.match_score >= 75 else "inverse"
+                        st.metric("Quality Score", f"{data.match_score}/100", delta_color=score_color)
 
-                    # Detalii
+                    # ===============================
+                    # QUICK STATS ROW
+                    # ===============================
+                    city = data.location.city if data.location else "Nespecificat"
+                    country = data.location.country if data.location else ""
+                    is_remote = data.location.is_remote if data.location else False
+
+                    salary_text = "Nespecificat"
+                    if data.salary_range:
+                        salary_text = f"{data.salary_range.min}-{data.salary_range.max} {data.salary_range.currency}"
+
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.info(f"**City:** {data.location.city}")
-                    c2.info(f"**Remote:** {'Da' if data.location.is_remote else 'Nu'}")
-                    c3.success(f"**Tehnologii:** {len(data.tech_stack)}")
-                    c4.error(f"**Red Flags:** {len(data.red_flags)}")
 
-                    st.markdown(f"**📝 Rezumat:** {data.summary}")
-                    st.markdown("#### 🛠️ Tech Stack")
-                    st.write(", ".join([f"`{tech}`" for tech in data.tech_stack]))
+                    c1.info(f"📍 **Locație:** {city} {country}")
+                    c2.info(f"🏠 **Remote:** {'Da' if is_remote else 'Nu'}")
+                    c3.success(f"🛠️ **Tehnologii:** {len(data.tech_stack)}")
+                    c4.warning(f"🚩 **Red Flags:** {len(data.red_flags)}")
+
+                    # ===============================
+                    # SALARY SECTION
+                    # ===============================
+                    st.markdown("### 💰 Salary")
+                    if data.salary_range:
+                        st.success(f"Interval salarial: **{salary_text}**")
+                    else:
+                        st.caption("Nu este specificat un interval salarial.")
+
+                    # ===============================
+                    # SUMMARY SECTION
+                    # ===============================
+                    st.markdown("### 📝 Rezumat")
+                    st.info(data.summary)
+
+                    # ===============================
+                    # TECH STACK SECTION
+                    # ===============================
+                    st.markdown("### 🛠️ Tech Stack")
+
+                    if data.tech_stack:
+                        tech_badges = " ".join([f"`{tech}`" for tech in data.tech_stack])
+                        st.markdown(tech_badges)
+                    else:
+                        st.caption("Nu au fost identificate tehnologii clare.")
+
+                    # ===============================
+                    # RED FLAGS SECTION
+                    # ===============================
+                    st.markdown("### 🚩 Avertismente")
 
                     if data.red_flags:
-                        st.markdown("#### 🚩 Avertismente")
                         for flag in data.red_flags:
-                            st.warning(f"⚠️ {flag}")
+                            label = f"[{flag.severity.upper()} | {flag.category.upper()}]"
+                            
+                            if flag.severity == "high":
+                                st.error(f"{label} {flag.description}")
+                            elif flag.severity == "medium":
+                                st.warning(f"{label} {flag.description}")
+                            else:
+                                st.info(f"{label} {flag.description}")
+                    else:
+                        st.success("Nu au fost detectate red flags majore.")
 
                 except Exception as e:
                     st.error(f"Eroare AI: {str(e)}")
