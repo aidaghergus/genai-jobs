@@ -70,6 +70,15 @@ class Location(BaseModel):
     is_remote: bool = Field(False, description="True dacă jobul este remote sau hibrid")
 
 
+class RawExtraction(BaseModel):
+    role_title: str | None = None
+    company_name: str | None = None
+    seniority: Literal["Intern", "Junior", "Mid", "Senior", "Lead", "Architect"] | None = None
+    tech_stack: List[str]
+    salary_range: Optional[SalaryRange] = None  
+    location: Optional[Location] = None
+    requirements: List[str]
+    
 class RedFlag(BaseModel):
     severity: Literal["low", "medium", "high"] = Field(
         ..., description="Nivel gravitate"
@@ -79,46 +88,13 @@ class RedFlag(BaseModel):
     )
     description: str = Field(..., description="Descriere scurtă")
 
-
+    
 class JobAnalysis(BaseModel):
-    role_title: str
-    company_name: str
-
-    seniority: Literal["Intern", "Junior", "Mid", "Senior", "Lead", "Architect"]
-
-    match_score: int = Field(..., ge=0, le=100)
-
-    tech_stack: List[str]
-
-    salary_range: Optional[SalaryRange] = None
-    location: Optional[Location] = None
-
-    red_flags: List[RedFlag] = Field(default_factory=list)
-
     summary: str
-
-    @model_validator(mode="after")
-    def validate_remote_consistency(self):
-        """
-        Dacă jobul e remote, dar apar indicii că e necesară prezența fizică,
-        adăugăm automat un red flag.
-        """
-
-        if self.location and self.location.is_remote:
-            office_keywords = ["on-site", "office presence", "la birou", "prezență fizică"]
-
-            for flag in self.red_flags:
-                if any(keyword in flag.description.lower() for keyword in office_keywords):
-                    self.red_flags.append(
-                        RedFlag(
-                            severity="medium",
-                            category="unrealistic",
-                            description="Job marcat remote, dar descrierea sugerează prezență fizică."
-                        )
-                    )
-                    break
-
-        return self
+    match_score: int = Field(..., ge=0, le=100)
+    red_flags: List[RedFlag] = Field(default_factory=list)
+    negotiation_tip: str
+    interview_questions: List[str]
 
 # ==============================================================================
 # 3. UTILS - SCRAPER (Colectare Date)
@@ -152,22 +128,21 @@ def scrape_clean_job_text(url: str, max_chars: int = 3000) -> str:
         return f"Scraping Error: {str(e)}"
 
 # ==============================================================================
-# 4. AI SERVICE LAYER (Logica LLM)
+# 4. AI SERVICE LAYER - EXTRACTION (Logica LLM)
 # ==============================================================================
 
-def analyze_job_with_ai(text: str) -> JobAnalysis:
+def extract_job_details_with_ai(text: str) -> RawExtraction:
     """
     Trimite textul curățat către Groq și returnează obiectul structurat.
     """
     return client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        response_model=JobAnalysis,
+        response_model=RawExtraction,
         messages=[
             {
                 "role": "system", 
                 "content": (
-                    "Ești un Recruiter Expert în IT. Analizează textul jobului cu obiectivitate. "
-                    "Identifică tehnologiile și potențialele probleme (red flags). "
+                    "Extrage informatii din textul jobului cu obiectivitate. "
                     "Răspunde strict în formatul cerut."
                 )
             },
@@ -176,7 +151,35 @@ def analyze_job_with_ai(text: str) -> JobAnalysis:
                 "content": f"Analizează acest job description:\n\n{text}"
             }
         ],
-        temperature=0.1,
+        temperature=0.0,
+    )
+
+# ==============================================================================
+# 5. AI SERVICE LAYER - INTERPRETATION (Logica LLM)
+# ==============================================================================
+
+def interpret_job_details_with_ai(input: RawExtraction) -> JobAnalysis:
+    """
+    Trimite datele extrase către Groq și returnează interpretarea intr-un obiect structurat.
+    """
+    return client.chat.completions.create(
+        model="qwen/qwen3-32b",
+        response_model=JobAnalysis,
+        messages=[
+            {
+                "role": "system", 
+                "content": (
+                    "Ești un Recruiter Expert în IT. Analizează jobul cu obiectivitate. "
+                    "Daca location.is_remote e True dar requirements sugereaza prezenta la birou, adauga un red flag cu severity medium si category unrealistic."
+                    "Răspunde strict în formatul cerut."
+                )
+            },
+            {
+                "role": "user", 
+                "content": f"Analizează acest job:\n\n{input}"
+            }
+        ],
+        temperature=0.7,
     )
 
 # ==============================================================================
@@ -205,7 +208,11 @@ with tab1:
                 st.error(raw_text)
             else:
                 try:
-                    data = analyze_job_with_ai(raw_text)
+                    raw_data = extract_job_details_with_ai(raw_text)
+                    st.info(raw_data)
+                    
+                    interpreted_data = interpret_job_details_with_ai(raw_data)
+                    st.info(interpreted_data)
                     
                     # -- DISPLAY --
                     st.divider()
@@ -216,36 +223,36 @@ with tab1:
                     col_h1, col_h2 = st.columns([3, 1])
 
                     with col_h1:
-                        st.markdown(f"## {data.role_title}")
-                        st.caption(f"🏢 {data.company_name} • 🎯 {data.seniority}")
+                        st.markdown(f"## {raw_data.role_title}")
+                        st.caption(f"🏢 {raw_data.company_name} • 🎯 {raw_data.seniority}")
 
                     with col_h2:
-                        score_color = "normal" if data.match_score >= 75 else "inverse"
-                        st.metric("Quality Score", f"{data.match_score}/100", delta_color=score_color)
+                        score_color = "normal" if interpreted_data.match_score >= 75 else "inverse"
+                        st.metric("Quality Score", f"{interpreted_data.match_score}/100", delta_color=score_color)
 
                     # ===============================
                     # QUICK STATS ROW
                     # ===============================
-                    city = data.location.city if data.location else "Nespecificat"
-                    country = data.location.country if data.location else ""
-                    is_remote = data.location.is_remote if data.location else False
+                    city = raw_data.location.city if raw_data.location else "Nespecificat"
+                    country = raw_data.location.country if raw_data.location else ""
+                    is_remote = raw_data.location.is_remote if raw_data.location else False
 
                     salary_text = "Nespecificat"
-                    if data.salary_range:
-                        salary_text = f"{data.salary_range.min}-{data.salary_range.max} {data.salary_range.currency}"
+                    if raw_data.salary_range:
+                        salary_text = f"{raw_data.salary_range.min}-{raw_data.salary_range.max} {raw_data.salary_range.currency}"
 
                     c1, c2, c3, c4 = st.columns(4)
 
                     c1.info(f"📍 **Locație:** {city} {country}")
                     c2.info(f"🏠 **Remote:** {'Da' if is_remote else 'Nu'}")
-                    c3.success(f"🛠️ **Tehnologii:** {len(data.tech_stack)}")
-                    c4.warning(f"🚩 **Red Flags:** {len(data.red_flags)}")
+                    c3.success(f"🛠️ **Tehnologii:** {len(raw_data.tech_stack)}")
+                    c4.warning(f"🚩 **Red Flags:** {len(interpreted_data.red_flags)}")
 
                     # ===============================
                     # SALARY SECTION
                     # ===============================
                     st.markdown("### 💰 Salary")
-                    if data.salary_range:
+                    if raw_data.salary_range:
                         st.success(f"Interval salarial: **{salary_text}**")
                     else:
                         st.caption("Nu este specificat un interval salarial.")
@@ -254,15 +261,15 @@ with tab1:
                     # SUMMARY SECTION
                     # ===============================
                     st.markdown("### 📝 Rezumat")
-                    st.info(data.summary)
+                    st.info(interpreted_data.summary)
 
                     # ===============================
                     # TECH STACK SECTION
                     # ===============================
                     st.markdown("### 🛠️ Tech Stack")
 
-                    if data.tech_stack:
-                        tech_badges = " ".join([f"`{tech}`" for tech in data.tech_stack])
+                    if raw_data.tech_stack:
+                        tech_badges = " ".join([f"`{tech}`" for tech in raw_data.tech_stack])
                         st.markdown(tech_badges)
                     else:
                         st.caption("Nu au fost identificate tehnologii clare.")
@@ -272,8 +279,8 @@ with tab1:
                     # ===============================
                     st.markdown("### 🚩 Avertismente")
 
-                    if data.red_flags:
-                        for flag in data.red_flags:
+                    if interpreted_data.red_flags:
+                        for flag in interpreted_data.red_flags:
                             label = f"[{flag.severity.upper()} | {flag.category.upper()}]"
                             
                             if flag.severity == "high":
@@ -287,6 +294,7 @@ with tab1:
 
                 except Exception as e:
                     st.error(f"Eroare AI: {str(e)}")
+
 
 # --- TAB 2: BATCH PROCESSING ---
 with tab2:
@@ -309,13 +317,16 @@ with tab2:
                 
                 if "Error" not in text:
                     try:
-                        res = analyze_job_with_ai(text)
+                        raw_data = extract_job_details_with_ai(text)
+                    
+                        interpreted_data = interpret_job_details_with_ai(raw_data)
+                        
                         results.append({
-                            "Role": res.role_title,
-                            "Company": res.company_name,
-                            "Seniority": res.seniority,
-                            "Tech": res.tech_stack,
-                            "Score": res.match_score
+                            "Role": raw_data.role_title,
+                            "Company": raw_data.company_name,
+                            "Seniority": raw_data.seniority,
+                            "Tech": raw_data.tech_stack,
+                            "Score": interpreted_data.match_score
                         })
                     except:
                         pass # Continuăm chiar dacă unul crapă
